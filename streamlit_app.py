@@ -20,7 +20,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("💬 AI yorumu (opsiyonel)")
     use_ai = st.checkbox("AI yorumunu üret (OpenAI API anahtarı gerekli)")
-    ai_model = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o"], index=0)
+    ai_model = st.selectbox("Model", ["llama3-8b-8192"], index=0)
     openai_key = st.text_input("OPENAI_API_KEY", type="password", help="İstersen buraya gir; çevrede tanımlıysa boş bırak.")
     st.markdown("---")
     st.caption("💡 İpucu: Sabit giderlerin ürün başına payını hesaplarken aylık toplam üretim tahmininizi doğru girin.")
