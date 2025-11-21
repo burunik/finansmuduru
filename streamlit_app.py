@@ -144,7 +144,10 @@ if use_ai:
         st.warning("AI için OpenAI API anahtarı girilmedi.")
     else:
         try:
-            client = OpenAI(api_key=key)
+            client = OpenAI(
+                api_key=key,
+                base_url="https://api.groq.com/openai/v1"
+                                    )
             with st.spinner("AI yorumu üretiliyor..."):
                 resp = client.chat.completions.create(
                     model=ai_model,
