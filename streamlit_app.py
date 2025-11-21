@@ -1,36 +1,34 @@
+import os
 
+app_neon = r'''
 import os
 import json
-import sqlite3
 from datetime import date, datetime
 from io import StringIO
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, text
 
-# ---------------------------
-# App Config
-# ---------------------------
 st.set_page_config(page_title="Mini Fiyat Analizcisi Pro", page_icon="🧮", layout="wide")
 st.title("🧮 Mini Fiyat Analizcisi Pro")
-st.caption("Tarih bazlı maliyet takibi, aylık kâr/zarar raporu ve **Now** vs **What‑If** senaryoları")
+st.caption("Neon/PostgreSQL ile kalıcı kayıt, tarih bazlı maliyet takibi, aylık kâr/zarar ve **Now vs What-If** senaryoları")
 
-DB_PATH = "/mnt/data/mini_fiyat.db"
+PG_DSN = os.getenv("PG_DSN")
 
-# ---------------------------
-# DB Helpers
-# ---------------------------
-def get_conn():
-    os.makedirs("/mnt/data", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    return conn
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    if not PG_DSN:
+        raise RuntimeError("PG_DSN ortam değişkeni tanımlı değil. Streamlit Secrets'e PG_DSN connection string ekleyin.")
+    eng = create_engine(PG_DSN, pool_pre_ping=True)
+    return eng
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
+    eng = get_engine()
+    with eng.begin() as con:
+        con.execute(text("""
         CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             record_date TEXT,
             year_month TEXT,
             scenario TEXT,
@@ -57,42 +55,40 @@ def init_db():
             profit REAL,
             created_at TEXT
         )
-    """)
-    conn.commit()
-    conn.close()
+        """))
 
 def save_record(payload: dict):
-    conn = get_conn()
-    cur = conn.cursor()
+    eng = get_engine()
     cols = ",".join(payload.keys())
-    qmarks = ",".join(["?"] * len(payload))
-    cur.execute(f"INSERT INTO records ({cols}) VALUES ({qmarks})", list(payload.values()))
-    conn.commit()
-    conn.close()
+    qmarks = ",".join([f":{c}" for c in payload.keys()])
+    stmt = text(f"INSERT INTO records ({cols}) VALUES ({qmarks})")
+    with eng.begin() as con:
+        con.execute(stmt, payload)
 
 def load_month(year_month: str):
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM records WHERE year_month = ? ORDER BY record_date DESC, id DESC",
-                           conn, params=(year_month,))
-    conn.close()
+    eng = get_engine()
+    query = text("SELECT * FROM records WHERE year_month = :ym ORDER BY record_date DESC, id DESC")
+    df = pd.read_sql_query(query, eng, params={"ym": year_month})
     return df
 
 def load_all(limit=500):
-    conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM records ORDER BY record_date DESC, id DESC LIMIT ?", conn, params=(limit,))
-    conn.close()
+    eng = get_engine()
+    query = text("SELECT * FROM records ORDER BY record_date DESC, id DESC LIMIT :lim")
+    df = pd.read_sql_query(query, eng, params={"lim": limit})
     return df
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error(f"Veritabanı bağlantı hatası: {e}")
+    st.stop()
 
-# ---------------------------
-# Utilities
-# ---------------------------
+from openai import OpenAI
+
 def calc_finance(materials_df: pd.DataFrame, labor_hours: float, hourly_rate: float,
                  monthly_rent: float, monthly_util: float, other_fixed: float,
                  employee_count: int, avg_salary: float, monthly_total_production: int,
                  batch_size: int, target_margin_pct: float, actual_price: float | None):
-    # Materials
     df = materials_df.copy()
     if len(df.columns) == 0:
         df = pd.DataFrame(columns=["Malzeme","Miktar","Birim","Birim Fiyatı (₺)"])
@@ -101,10 +97,8 @@ def calc_finance(materials_df: pd.DataFrame, labor_hours: float, hourly_rate: fl
     df["Tutar (₺)"] = df.get("Miktar", 0).fillna(0) * df.get("Birim Fiyatı (₺)", 0).fillna(0)
     materials_total = float(df["Tutar (₺)"].sum())
 
-    # Labor
     labor_total = float(labor_hours * hourly_rate)
 
-    # Fixed allocation
     payroll = float(employee_count * avg_salary)
     fixed_total_monthly = float(monthly_rent + monthly_util + other_fixed + payroll)
     fixed_cost_per_unit_allocation = fixed_total_monthly / max(monthly_total_production, 1)
@@ -137,11 +131,8 @@ def calc_finance(materials_df: pd.DataFrame, labor_hours: float, hourly_rate: fl
 def ym_from_date(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
-# ---------------------------
-# Sidebar: Navigation & Settings
-# ---------------------------
 st.sidebar.header("📍 Gezinti")
-page = st.sidebar.radio("Sayfa", ["Now (Gerçek durum)", "What‑If (Senaryo)", "Geçmiş & Raporlar", "Yardım"])
+page = st.sidebar.radio("Sayfa", ["Now (Gerçek durum)", "What-If (Senaryo)", "Geçmiş & Raporlar", "Yardım"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ AI Yorumu (opsiyonel)")
@@ -158,11 +149,8 @@ else:
 api_key = st.sidebar.text_input(api_key_label, type="password", help="Anahtarını buraya gir.")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("💡 İpucu: **Now** gerçek verileri, **What‑If** simülasyonları ayrı ayrı kaydeder.")
+st.sidebar.caption("💡 İpucu: **Now** gerçek verileri, **What-If** senaryoları ayrı kaydeder.")
 
-# ---------------------------
-# Shared Inputs
-# ---------------------------
 def materials_editor(default_rows=None, key="materials"):
     if default_rows is None:
         default_rows = [
@@ -174,7 +162,6 @@ def materials_editor(default_rows=None, key="materials"):
     return df
 
 def ai_commentary(prompt: str):
-    from openai import OpenAI
     try:
         if not api_key:
             return ""
@@ -213,9 +200,6 @@ Toplam: {calc['total_cost']} ₺
 Not: {note}
 """.strip()
 
-# ---------------------------
-# Page: NOW
-# ---------------------------
 if page == "Now (Gerçek durum)":
     st.header("Now — Gerçek Üretim ve Satış")
     st.write("**Now**: Gerçek maliyetleri ve **fiili satış fiyatını** girersin; kâr/zararı hesaplar ve tarih ile kaydeder.")
@@ -254,13 +238,11 @@ if page == "Now (Gerçek durum)":
     st.markdown("### 🎯 Hedef Kâr (karşılaştırma için)")
     target_margin_pct = st.slider("Hedef kâr oranı (%)", min_value=0, max_value=200, value=30, step=5, key="margin_now")
 
-    # Calculate
     calc = calc_finance(materials_df, labor_hours, hourly_rate,
                         monthly_rent, monthly_util, other_fixed,
                         employee_count, avg_salary, monthly_total_production,
                         batch_size, target_margin_pct, actual_price)
 
-    # Results
     st.markdown("---")
     st.subheader("📊 Sonuçlar — Now")
     r1, r2, r3, r4 = st.columns(4)
@@ -284,11 +266,10 @@ if page == "Now (Gerçek durum)":
             st.markdown("#### 💬 AI Yorumu")
             st.write(comment)
 
-    # Save NOW
     if st.button("💾 Kaydet (Now)"):
         payload = {
             "record_date": record_date.isoformat(),
-            "year_month": f"{record_date.year:04d}-{record_date.month:02d}",
+            "year_month": ym_from_date(record_date),
             "scenario": "now",
             "product_name": product_name,
             "batch_size": int(batch_size),
@@ -316,12 +297,9 @@ if page == "Now (Gerçek durum)":
         save_record(payload)
         st.success("Now kaydı oluşturuldu ✅")
 
-# ---------------------------
-# Page: WHAT-IF
-# ---------------------------
-elif page == "What‑If (Senaryo)":
-    st.header("What‑If — Senaryo Analizi")
-    st.write("**What‑If**: Gerçek satış fiyatı yerine **hedef kâr** belirleyip önerilen fiyat ve beklenen kârı görürsün; kayıt **senaryo** olarak saklanır.")
+elif page == "What-If (Senaryo)":
+    st.header("What-If — Senaryo Analizi")
+    st.write("**What-If**: Hedef kâra göre önerilen fiyat ve beklenen kârı simüle eder; kayıt **senaryo** olarak saklanır.")
 
     col_top = st.columns(4)
     with col_top[0]:
@@ -360,7 +338,7 @@ elif page == "What‑If (Senaryo)":
                         batch_size, target_margin_pct, actual_price=None)
 
     st.markdown("---")
-    st.subheader("📊 Sonuçlar — What‑If")
+    st.subheader("📊 Sonuçlar — What-If")
     r1, r2, r3 = st.columns(3)
     r1.metric("Toplam maliyet (batch)", f"{calc['total_cost']:.2f} ₺")
     r2.metric("Birim maliyet", f"{calc['unit_cost']:.2f} ₺/adet")
@@ -371,16 +349,16 @@ elif page == "What‑If (Senaryo)":
     st.metric("Beklenen kâr (senaryo)", f"{expected_profit:.2f} ₺")
 
     if use_ai and api_key:
-        prompt = build_prompt(product_name, batch_size, target_margin_pct, None, calc, note="What‑If senaryosu")
+        prompt = build_prompt(product_name, batch_size, target_margin_pct, None, calc, note="What-If senaryosu")
         comment = ai_commentary(prompt)
         if comment:
             st.markdown("#### 💬 AI Yorumu")
             st.write(comment)
 
-    if st.button("💾 Kaydet (What‑If)"):
+    if st.button("💾 Kaydet (What-If)"):
         payload = {
             "record_date": record_date.isoformat(),
-            "year_month": f"{record_date.year:04d}-{record_date.month:02d}",
+            "year_month": ym_from_date(record_date),
             "scenario": "what_if",
             "product_name": product_name,
             "batch_size": int(batch_size),
@@ -406,19 +384,16 @@ elif page == "What‑If (Senaryo)":
             "created_at": datetime.utcnow().isoformat(timespec="seconds")
         }
         save_record(payload)
-        st.success("What‑If kaydı oluşturuldu ✅")
+        st.success("What-If kaydı oluşturuldu ✅")
 
-# ---------------------------
-# Page: History & Reports
-# ---------------------------
 elif page == "Geçmiş & Raporlar":
     st.header("📒 Geçmiş & Aylık Raporlar")
     all_df = load_all(limit=1000)
     if all_df.empty:
-        st.info("Henüz kayıt yok. **Now** veya **What‑If** sayfasından kayıt oluşturun.")
+        st.info("Henüz kayıt yok. **Now** veya **What-If** sayfasından kayıt oluşturun.")
     else:
         months = sorted(all_df["year_month"].unique())
-        sel_month = st.selectbox("Ay seç (YYYY‑MM)", months, index=0)
+        sel_month = st.selectbox("Ay seç (YYYY-MM)", months, index=0)
 
         month_df = load_month(sel_month)
         st.markdown(f"### {sel_month} — Kayıtlar")
@@ -461,19 +436,18 @@ elif page == "Geçmiş & Raporlar":
         month_df.to_csv(csv_buf, index=False)
         st.download_button("Bu ayın tüm kayıtlarını CSV indir", data=csv_buf.getvalue(), file_name=f"kayitlar_{sel_month}.csv", mime="text/csv")
 
-# ---------------------------
-# Page: Help
-# ---------------------------
 else:
     st.header("❓ Yardım / Kullanım Kılavuzu")
     st.markdown("""
 **Gezinti**
-- **Now (Gerçek durum):** Gerçek satış fiyatı ile kâr/zararı hesaplar ve **kaydeder**.
-- **What‑If (Senaryo):** Hedef kâra göre önerilen fiyat ve beklenen kârı **simüle eder**; ayrı kayıt edilir.
+- **Now (Gerçek durum):** Gerçek satış fiyatı ile kâr/zararı hesaplar ve **Neon/Postgres'e kaydeder**.
+- **What-If (Senaryo):** Hedef kâra göre önerilen fiyat ve beklenen kârı **simüle eder**; ayrı kayıt edilir.
 - **Geçmiş & Raporlar:** Ay bazında tüm kayıtları listeler, günlük kâr grafiği ve senaryo bazlı kâr dağılımı sunar.
 
-**Tarih & Ay mantığı**
-- Kayıtlar seçilen **tarih** ile saklanır; ay bazlı rapor için `YYYY‑MM` kullanılır.
+**Neon Ayarı (PG_DSN)**
+- Neon'da bir proje açın, connection string'i kopyalayın.
+- Streamlit Cloud'da **Settings → Secrets** kısmına şu şekilde ekleyin:
+  `PG_DSN = "postgresql://kullanici:parola@host/dbadiniz"`
 
 **Sabit giderlerin payı**
 - Kira, fatura, maaş gibi giderler aylık toplamdan **ürün başına** paylaştırılır (Aylık toplam üretim adedine göre).
@@ -481,8 +455,23 @@ else:
 **AI Yorumu (opsiyonel)**
 - Ücretsiz Groq anahtarıyla kısa Türkçe yorum alabilirsiniz (sağda sağlayıcı seçin).
 - Anahtar girilmezse uygulama onsuz çalışır.
-
-**Veri saklama**
-- Veriler `mini_fiyat.db` (SQLite) içinde saklanır.
 """)
-    st.info("İpucu: **Now** ve **What‑If** senaryolarını ayrı kaydetmek, geçmişte fiili sonuçlarla planların farkını görmenizi sağlar.")
+    st.info("İpucu: **Now** ve **What-If** senaryolarını ayrı kaydetmek, fiili sonuçlarla planların farkını görmenizi sağlar.")
+'''
+
+reqs_neon = r'''
+streamlit==1.39.0
+pandas==2.2.3
+openai>=1.43.0
+matplotlib==3.9.2
+sqlalchemy>=2.0.36
+psycopg2-binary>=2.9.9
+'''
+
+os.makedirs("/mnt/data", exist_ok=True)
+with open("/mnt/data/app_neon.py", "w", encoding="utf-8") as f:
+    f.write(app_neon)
+with open("/mnt/data/requirements_neon.txt", "w", encoding="utf-8") as f:
+    f.write(reqs_neon)
+
+"/mnt/data/app_neon.py and /mnt/data/requirements_neon.txt created."
